@@ -1,0 +1,84 @@
+# Morphometry Tool Configuration
+
+# Paths
+data:
+  raw_dir: "../data/raw"
+  processed_dir: "../data/processed"
+  output_dir: "../results"
+
+# Preprocessing parameters
+preprocessing:
+  resize:
+    enable: true
+    height: 512
+    width: 512
+  normalization:
+    enable: true
+    method: "z-score"  # Options: z-score, min-max, histogram_equalization
+  augmentation:
+    enable: true
+    rotation_range: 20
+    width_shift_range: 0.2
+    height_shift_range: 0.2
+    shear_range: 0.2
+    zoom_range: 0.2
+    horizontal_flip: true
+    vertical_flip: false
+    fill_mode: "nearest"
+
+# Feature extraction parameters
+feature_extraction:
+  methods:
+    - name: "basic_morphometry"
+      enable: true
+    - name: "texture_analysis"
+      enable: true
+      glcm_distances: [1, 3, 5]
+      glcm_angles: [0, 45, 90, 135]
+    - name: "shape_descriptors"
+      enable: true
+    - name: "deep_features"
+      enable: true
+      model: "resnet50"
+      layer: "avg_pool"
+
+# Model parameters
+model:
+  type: "ensemble"  # Options: cnn, random_forest, gradient_boosting, ensemble
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  optimizer: "adam"
+  loss: "categorical_crossentropy"
+  metrics: ["accuracy", "precision", "recall", "f1"]
+  save_dir: "../models"
+  early_stopping:
+    enable: true
+    patience: 10
+    monitor: "val_loss"
+
+# Evaluation parameters
+evaluation:
+  cross_validation:
+    enable: true
+    n_splits: 5
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc"]
+  confusion_matrix: true
+
+# Visualization parameters
+visualization:
+  feature_importance: true
+  tsne: true
+  umap: true
+  confusion_matrix: true
+  roc_curve: true
+  
+# Clinical reporting
+clinical:
+  report_template: "../docs/report_template.md"
+  include_raw_measurements: true
+  include_visualizations: true
+  include_model_confidence: true
+  reference_ranges:
+    include: true
+    source: "../data/reference_ranges.csv"
