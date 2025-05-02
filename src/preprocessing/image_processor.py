@@ -11,6 +11,10 @@ import pydicom
 from pathlib import Path
 from skimage import exposure, filters, morphology, segmentation
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import functools
+from joblib import Memory
+import hashlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,28 +30,83 @@ class ImageProcessor:
         self.processed_dir = Path(config['data']['processed_dir'])
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         
+        # Setup cache for processed images
+        cache_dir = self.processed_dir / '.cache'
+        self.memory = Memory(cache_dir, verbose=0)
+        self.cached_process_image = self.memory.cache(self._process_image_impl)
+        
+        # Number of workers for parallel processing
+        self.n_workers = os.cpu_count() or 1
+        # Use fewer workers if there's not much RAM available
+        if self.n_workers > 4:
+            self.n_workers = min(self.n_workers, 8)  # Limit workers to avoid memory issues
+    
     def process_directory(self, input_dir):
-        """Process all images in a directory"""
+        """Process all images in a directory using parallel execution"""
         input_dir = Path(input_dir)
-        logger.info(f"Processing images from {input_dir}")
+        logger.info(f"Processing images from {input_dir} with {self.n_workers} workers")
+        
+        image_files = self._get_image_files(input_dir)
+        total_files = len(image_files)
+        logger.info(f"Found {total_files} images to process")
         
         processed_images = {}
-        for file_path in self._get_image_files(input_dir):
-            try:
-                image_id = file_path.stem
-                image = self.load_image(file_path)
-                processed_image = self.process_image(image, image_id)
-                processed_images[image_id] = processed_image
+        
+        # Use batched processing to avoid memory issues with large datasets
+        batch_size = 50  # Adjust based on available memory
+        image_batches = [image_files[i:i + batch_size] for i in range(0, len(image_files), batch_size)]
+        
+        for batch_idx, batch in enumerate(image_batches):
+            logger.info(f"Processing batch {batch_idx+1}/{len(image_batches)} ({len(batch)} images)")
+            batch_results = {}
+            
+            with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+                # Submit all jobs
+                future_to_path = {
+                    executor.submit(self._process_single_image, file_path): file_path 
+                    for file_path in batch
+                }
                 
-                # Save processed image if needed
-                output_path = self.processed_dir / f"{image_id}.npy"
-                np.save(output_path, processed_image)
-                
-            except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}")
+                # Process results as they complete
+                for future in as_completed(future_to_path):
+                    file_path = future_to_path[future]
+                    try:
+                        image_id, processed_image = future.result()
+                        batch_results[image_id] = processed_image
+                    except Exception as e:
+                        logger.error(f"Error processing {file_path}: {e}")
+            
+            processed_images.update(batch_results)
+            
+            # Explicit garbage collection after each batch
+            import gc
+            gc.collect()
         
         logger.info(f"Processed {len(processed_images)} images")
         return processed_images
+    
+    def _process_single_image(self, file_path):
+        """Process a single image file (designed for parallel execution)"""
+        try:
+            image_id = file_path.stem
+            image = self.load_image(file_path)
+            
+            # Generate cache key based on image content and config
+            config_str = str(self.preprocessing_config)
+            image_hash = hashlib.md5(image.tobytes()).hexdigest()
+            cache_key = f"{image_hash}_{config_str}"
+            
+            processed_image = self.cached_process_image(image, image_id, cache_key)
+            
+            # Save processed image
+            output_path = self.processed_dir / f"{image_id}.npy"
+            np.save(output_path, processed_image)
+            
+            return image_id, processed_image
+            
+        except Exception as e:
+            logger.error(f"Error in _process_single_image for {file_path}: {str(e)}")
+            raise
     
     def _get_image_files(self, directory):
         """Get all image files in directory and subdirectories"""
@@ -90,8 +149,8 @@ class ImageProcessor:
                 image = image[image.shape[0] // 2, :, :]
                 
         else:
-            # Handle standard image formats
-            image = cv2.imread(str(file_path))
+            # Handle standard image formats - use IMREAD_UNCHANGED for best compatibility
+            image = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
             if image is None:
                 raise ValueError(f"Failed to load image: {file_path}")
             
@@ -111,7 +170,16 @@ class ImageProcessor:
         return image
     
     def process_image(self, image, image_id=None):
-        """Apply preprocessing steps to an image"""
+        """Apply preprocessing steps to an image with caching"""
+        # Generate cache key based on image content and config
+        config_str = str(self.preprocessing_config)
+        image_hash = hashlib.md5(image.tobytes()).hexdigest()
+        cache_key = f"{image_hash}_{config_str}"
+        
+        return self.cached_process_image(image, image_id, cache_key)
+    
+    def _process_image_impl(self, image, image_id=None, cache_key=None):
+        """Implementation of image processing (cached version)"""
         # Make a copy to avoid modifying the original
         processed = image.copy()
         
@@ -119,7 +187,13 @@ class ImageProcessor:
         if self.preprocessing_config['resize']['enable']:
             height = self.preprocessing_config['resize']['height']
             width = self.preprocessing_config['resize']['width']
-            processed = cv2.resize(processed, (width, height))
+            # Use INTER_AREA for downsampling and INTER_CUBIC for upsampling
+            if processed.shape[0] > height or processed.shape[1] > width:
+                interpolation = cv2.INTER_AREA
+            else:
+                interpolation = cv2.INTER_CUBIC
+                
+            processed = cv2.resize(processed, (width, height), interpolation=interpolation)
         
         # Convert to grayscale if it's a color image
         if len(processed.shape) == 3 and processed.shape[2] == 3:

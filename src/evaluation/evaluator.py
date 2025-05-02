@@ -9,13 +9,17 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import os
 import pickle
+import joblib
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, 
     roc_curve, auc, precision_recall_curve, confusion_matrix, 
-    classification_report
+    classification_report, roc_auc_score
 )
 import logging
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -31,6 +35,9 @@ class Evaluator:
         self.output_dir = Path(config['data']['output_dir'])
         self.results_dir = self.output_dir / 'evaluation'
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set number of parallel jobs
+        self.n_jobs = min(multiprocessing.cpu_count(), 4)
     
     def evaluate(self, model, features_df, labels=None, test_size=0.2):
         """
@@ -55,6 +62,7 @@ class Evaluator:
             Dictionary containing evaluation results
         """
         logger.info("Evaluating model performance")
+        start_time = time.time()
         
         # Prepare data
         X, y = self._prepare_data(features_df, labels)
@@ -72,6 +80,9 @@ class Evaluator:
         
         # Save results
         self._save_results(results)
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Model evaluation completed in {elapsed_time:.2f} seconds")
         
         return results
     
@@ -91,57 +102,68 @@ class Evaluator:
         # Drop any non-numeric columns
         X = X.select_dtypes(include=[np.number])
         
-        # Fill missing values
-        X = X.fillna(0)
+        # Fill missing values - use median for robustness
+        X = X.fillna(X.median())
         
         logger.info(f"Prepared data with {X.shape[0]} samples and {X.shape[1]} features")
         return X, y
     
     def _perform_cross_validation(self, model, X, y):
-        """Perform cross-validation evaluation"""
+        """Perform cross-validation evaluation with parallel processing"""
         n_splits = self.eval_config['cross_validation'].get('n_splits', 5)
         cv_metrics = self.eval_config.get('metrics', ['accuracy'])
         
-        logger.info(f"Performing {n_splits}-fold cross-validation")
+        logger.info(f"Performing {n_splits}-fold cross-validation with {self.n_jobs} parallel jobs")
         
         results = {}
         
         # Define stratified k-fold cross-validation
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         
-        # Calculate metrics for each fold
+        # Calculate metrics for each fold, using joblib for parallel processing
         for metric in cv_metrics:
-            if metric == 'accuracy':
-                scores = cross_val_score(model, X, y, cv=cv, scoring='accuracy')
-            elif metric == 'precision':
-                scores = cross_val_score(model, X, y, cv=cv, scoring='precision_weighted')
-            elif metric == 'recall':
-                scores = cross_val_score(model, X, y, cv=cv, scoring='recall_weighted')
-            elif metric == 'f1':
-                scores = cross_val_score(model, X, y, cv=cv, scoring='f1_weighted')
-            elif metric == 'roc_auc':
-                try:
-                    scores = cross_val_score(model, X, y, cv=cv, scoring='roc_auc_ovr_weighted')
-                except:
-                    logger.warning("ROC AUC score calculation failed, skipping")
-                    scores = np.array([])
-            else:
-                logger.warning(f"Unknown metric: {metric}, skipping")
-                scores = np.array([])
+            try:
+                if metric == 'accuracy':
+                    scoring = 'accuracy'
+                elif metric == 'precision':
+                    scoring = 'precision_weighted'
+                elif metric == 'recall':
+                    scoring = 'recall_weighted'
+                elif metric == 'f1':
+                    scoring = 'f1_weighted'
+                elif metric == 'roc_auc':
+                    # ROC AUC needs special handling for multi-class
+                    scoring = 'roc_auc_ovr_weighted' if len(np.unique(y)) > 2 else 'roc_auc'
+                else:
+                    logger.warning(f"Unknown metric: {metric}, skipping")
+                    continue
                 
-            # Store results
-            results[metric] = {
-                'scores': scores.tolist(),
-                'mean': float(np.mean(scores)),
-                'std': float(np.std(scores))
-            }
-            
-            logger.info(f"Cross-validation {metric}: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+                scores = cross_val_score(
+                    model, X, y, cv=cv, scoring=scoring, n_jobs=self.n_jobs
+                )
+                
+                # Store results
+                results[metric] = {
+                    'scores': scores.tolist(),
+                    'mean': float(np.mean(scores)),
+                    'std': float(np.std(scores))
+                }
+                
+                logger.info(f"Cross-validation {metric}: {np.mean(scores):.4f} ± {np.std(scores):.4f}")
+                
+            except Exception as e:
+                logger.error(f"Error calculating {metric} in cross-validation: {e}")
+                results[metric] = {
+                    'scores': [],
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'error': str(e)
+                }
         
         return results
     
     def _evaluate_on_test_set(self, model, X, y, test_size=0.2):
-        """Evaluate the model on a test set"""
+        """Evaluate the model on a test set with efficient computation"""
         from sklearn.model_selection import train_test_split
         
         # Split data into train and test sets
@@ -152,7 +174,8 @@ class Evaluator:
         # Train model on training set if not already fitted
         # This handles the case where a new model instance is passed
         try:
-            y_pred_proba = model.predict_proba(X_test)
+            # Quick check if model is already trained
+            y_pred_proba = model.predict_proba(X_test[:1])
             already_trained = True
         except:
             already_trained = False
@@ -164,24 +187,54 @@ class Evaluator:
         # Get predictions
         y_pred = model.predict(X_test)
         
-        # Calculate metrics
+        # Calculate metrics in parallel where possible
         metrics = self.eval_config.get('metrics', ['accuracy'])
         results = {}
         
-        # Basic metrics
-        if 'accuracy' in metrics:
-            results['accuracy'] = float(accuracy_score(y_test, y_pred))
+        def calculate_metric(metric_name):
+            """Helper function to calculate a single metric"""
+            if metric_name == 'accuracy':
+                return float(accuracy_score(y_test, y_pred))
+            
+            elif metric_name == 'precision':
+                return float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
+            
+            elif metric_name == 'recall':
+                return float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
+            
+            elif metric_name == 'f1':
+                return float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
+            
+            elif metric_name == 'roc_auc' and hasattr(model, 'predict_proba'):
+                # For binary classification
+                if len(np.unique(y)) == 2:
+                    try:
+                        y_pred_proba = model.predict_proba(X_test)[:, 1]
+                        return float(roc_auc_score(y_test, y_pred_proba))
+                    except:
+                        return None
+                # For multi-class
+                else:
+                    try:
+                        y_pred_proba = model.predict_proba(X_test)
+                        return float(roc_auc_score(y_test, y_pred_proba, multi_class='ovr', average='weighted'))
+                    except:
+                        return None
+            
+            return None
         
-        if 'precision' in metrics:
-            results['precision'] = float(precision_score(y_test, y_pred, average='weighted', zero_division=0))
+        # Use ThreadPool for metrics calculation
+        with joblib.parallel_backend('threading', n_jobs=self.n_jobs):
+            results_list = joblib.Parallel()(
+                joblib.delayed(calculate_metric)(metric) for metric in metrics
+            )
         
-        if 'recall' in metrics:
-            results['recall'] = float(recall_score(y_test, y_pred, average='weighted', zero_division=0))
+        # Assign results to dictionary
+        for i, metric in enumerate(metrics):
+            if results_list[i] is not None:
+                results[metric] = results_list[i]
         
-        if 'f1' in metrics:
-            results['f1'] = float(f1_score(y_test, y_pred, average='weighted', zero_division=0))
-        
-        # Confusion matrix
+        # Confusion matrix - not parallelized since it's simple and fast
         if self.eval_config.get('confusion_matrix', False):
             cm = confusion_matrix(y_test, y_pred)
             results['confusion_matrix'] = cm.tolist()
@@ -209,10 +262,14 @@ class Evaluator:
                         y_score = y_pred_proba[:, i]
                     else:
                         # For binary classification
-                        y_score = y_pred_proba[:, 1]
+                        if i == 0:
+                            y_score = 1 - y_pred_proba[:, 1]
+                        else:
+                            y_score = y_pred_proba[:, 1]
                     
-                    # Calculate ROC curve
-                    fpr, tpr, thresholds = roc_curve(y_true_binary, y_score)
+                    # Calculate ROC curve - efficient implementation
+                    # Use fewer thresholds to speed up calculation
+                    fpr, tpr, thresholds = roc_curve(y_true_binary, y_score, drop_intermediate=True)
                     roc_auc = auc(fpr, tpr)
                     
                     roc_results[str(cls)] = {
@@ -225,7 +282,6 @@ class Evaluator:
                 results['roc_auc'] = roc_results
                 
                 # Also calculate weighted average AUC
-                from sklearn.metrics import roc_auc_score
                 try:
                     avg_auc = roc_auc_score(y_test, y_pred_proba, multi_class='ovr', average='weighted')
                     results['weighted_auc'] = float(avg_auc)
@@ -244,19 +300,20 @@ class Evaluator:
         return results
     
     def _save_results(self, results):
-        """Save evaluation results to disk"""
+        """Save evaluation results to disk using optimized JSON serialization"""
         import json
+        import gzip
         
-        # Save as JSON 
+        # Save regular results
         results_path = self.results_dir / "evaluation_results.json"
         
         # Convert numpy arrays and other non-JSON-serializable objects
         def convert_to_serializable(obj):
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
-            if isinstance(obj, np.float32) or isinstance(obj, np.float64):
+            if isinstance(obj, (np.float32, np.float64)):
                 return float(obj)
-            if isinstance(obj, np.int32) or isinstance(obj, np.int64):
+            if isinstance(obj, (np.int32, np.int64)):
                 return int(obj)
             return obj
         
@@ -266,6 +323,8 @@ class Evaluator:
             for key, value in d.items():
                 if isinstance(value, dict):
                     result[key] = make_serializable(value)
+                elif isinstance(value, list):
+                    result[key] = [convert_to_serializable(item) for item in value]
                 else:
                     result[key] = convert_to_serializable(value)
             return result
@@ -274,6 +333,15 @@ class Evaluator:
         
         with open(results_path, 'w') as f:
             json.dump(serializable_results, f, indent=2)
+        
+        # Additionally, save a compressed version for large result sets
+        gzip_path = self.results_dir / "evaluation_results.json.gz"
+        try:
+            with gzip.open(gzip_path, 'wt') as f:
+                json.dump(serializable_results, f)
+            logger.info(f"Compressed evaluation results saved to {gzip_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save compressed results: {e}")
         
         logger.info(f"Evaluation results saved to {results_path}")
         
