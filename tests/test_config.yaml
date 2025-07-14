@@ -1,0 +1,63 @@
+# Test Configuration for Morphometry Tool
+
+# Paths (will be overridden by test setup)
+data:
+  raw_dir: "./test_data/raw"
+  processed_dir: "./test_data/processed"
+  output_dir: "./test_data/output"
+
+# Preprocessing parameters (simplified for testing)
+preprocessing:
+  resize:
+    enable: true
+    height: 128
+    width: 128
+  normalization:
+    enable: true
+    method: "z-score"
+  augmentation:
+    enable: false  # Disable for consistent testing
+
+# Feature extraction parameters (minimal for testing)
+feature_extraction:
+  methods:
+    - name: "basic_morphometry"
+      enable: true
+    - name: "texture_analysis"
+      enable: true
+      glcm_distances: [1]
+      glcm_angles: [0, 90]
+    - name: "shape_descriptors"
+      enable: true
+    - name: "deep_features"
+      enable: false  # Disable for testing
+
+# Model parameters (simplified for testing)
+model:
+  type: "random_forest"
+  batch_size: 8
+  epochs: 3
+  learning_rate: 0.01
+  save_dir: "./test_data/models"
+  early_stopping:
+    enable: false
+
+# Evaluation parameters
+evaluation:
+  cross_validation:
+    enable: true
+    n_splits: 3
+  metrics: ["accuracy", "precision", "recall", "f1"]
+
+# Visualization parameters (minimal for testing)
+visualization:
+  feature_importance: true
+  confusion_matrix: true
+  tsne: false  # Disable for testing
+  umap: false  # Disable for testing
+  
+# Clinical reporting (minimal for testing)
+clinical:
+  include_raw_measurements: true
+  include_visualizations: false  # Disable for testing
+  include_model_confidence: true
